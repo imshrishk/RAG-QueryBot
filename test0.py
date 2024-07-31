@@ -1,92 +1,168 @@
-from typing import List
-from llama_index.core.schema import Document
-from llama_index.llms.ollama import Ollama
-from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core import ChatPromptTemplate
-from llama_index.core import (
-    SimpleDirectoryReader,
-    load_index_from_storage,
-    VectorStoreIndex,
-    StorageContext,
-    Settings,
-    DocumentSummaryIndex,
-    get_response_synthesizer,
-)
-from llama_index.core.readers.base import BaseReader
-from llama_index.core.node_parser import SentenceSplitter
-#from llama_index.vector_stores.faiss import FaissVectorStore
-from llama_index.vector_stores.chroma import ChromaVectorStore
-import chromadb
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.retrievers import VectorIndexRetriever
-from dotenv import load_dotenv
-import openai
-import os
-#import faiss
+import streamlit as st
 import pandas as pd
-from llama_index.core.query_engine import RetrieverQueryEngine
+import chardet
+import shelve
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.output_parsers import StrOutputParser
+from langchain.prompts import ChatPromptTemplate
+from langchain_community.chat_models import ChatOllama
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+import tempfile
+import os
 
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+@st.cache_data
+def load_and_prepare_data(excel_path, text_path, chunk_size, chunk_overlap, cache_path='data_cache.db'):
+    with shelve.open(cache_path) as cache:
+        if 'chunks' in cache:
+            return cache['chunks']
+        
+        # Load Excel data in chunks
+        data = pd.read_excel(excel_path, chunksize=5000)
+        combined_data = pd.concat(data)
+        combined_data = combined_data[["url", "title", "about_this_item"]]
+        combined_data.to_csv(text_path, sep="\n", index=False)
 
-# d = 1024
-# faiss_index = faiss.IndexFlatL2(d)
+        # Detect the encoding of the file
+        with open(text_path, 'rb') as file:
+            result = chardet.detect(file.read())
+            encoding = result['encoding']
+        
+        # Load text documents
+        loader = TextLoader(file_path=text_path, encoding=encoding)
+        docs = loader.load()
 
-chroma_client = chromadb.EphemeralClient()
-chroma_collection = chroma_client.create_collection("shopping")
+        # Split documents into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = text_splitter.split_documents(docs)
 
-data_directory = r"C:\ParallelDots"
+        # Cache the chunks
+        cache['chunks'] = chunks
 
-class ExcelFileReader(BaseReader):
-    def load_data(self, file, extra_info=None) -> List[Document]:
-        df = pd.read_excel(file)
-        text = df.to_string(index=False)
-        return [Document(text=text + " Foobar", extra_info=extra_info or {})]
+    return chunks
 
-file_extractor = {".xlsx": ExcelFileReader()}
-documents = SimpleDirectoryReader(input_dir=data_directory, filename_as_id=True, file_extractor=file_extractor).load_data()
-Settings.llm = Ollama(model="llama3:instruct", request_timeout=1000)
-llm = Settings.llm
-Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-base-en-v1.5")
-# embed_model = Settings.embed_model
+def create_vector_store(chunks):
+    # Create embeddings
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    
+    # Create Chroma vector store and add documents
+    vectorstore = Chroma.from_documents(documents=chunks, collection_name="rag_chroma", embedding=embeddings)
+    return vectorstore
 
-response_synthesizer = get_response_synthesizer(
-    response_mode="tree_summarize", use_async=True
-)
-splitter = SentenceSplitter(chunk_size=1500, chunk_overlap = 100)
+def main():
+    st.title("Advanced Shopping Assistant")
 
-db = chromadb.PersistentClient(path="./chroma_db")
-chroma_collection = db.get_or_create_collection("shopping")
-vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-storage_context = StorageContext.from_defaults(vector_store=vector_store)
-index = VectorStoreIndex.from_documents(
-    documents, storage_context=storage_context,show_progress=True, transformations=[splitter])
+    # Sidebar for user adjustments
+    st.sidebar.header("Settings")
+    chunk_size = st.sidebar.slider("Chunk Size", min_value=100, max_value=2000, value=1000, step=100)
+    chunk_overlap = st.sidebar.slider("Chunk Overlap", min_value=0, max_value=1000, value=400, step=50)
 
-index.storage_context.persist(persist_dir="./storage")
+    # File upload for Excel data
+    uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
+    if uploaded_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            excel_path = tmp_file.name
+        
+        text_path = "data.txt"
 
-db2 = chromadb.PersistentClient(path="./chroma_db")
-chroma_collection = db2.get_or_create_collection("shopping")
-vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-index = VectorStoreIndex.from_vector_store(
-    vector_store,
-    transformations=[splitter]
-)
+        try:
+            # Load and prepare data
+            chunks = load_and_prepare_data(excel_path, text_path, chunk_size, chunk_overlap)
+            vectorstore = create_vector_store(chunks)
 
-qa_prompt_str='''Recommend me a eyeshadow stick which has the features listed: stick set 8 color, Multi-Purpose Makeup Eyeshadow Set: bold, creamy, crease resistant color with ease, durable and waterproof without wrinkles, smooth as silk without lumps, does not fade and has uniform color, can be used as a contouring or Highlight, has 8 colors , Easy to Use, No brushes required, just glide, highly pigmented, retractable eyeshadow stick for last part, multi -combination eyeshadow, Classy & Buildable Base Color, its soft and creamy texture  keep it subtle for a natural look!'''
+            # Display vector store info
+            st.write("Vector store created and documents added successfully.")
 
-# retriever = VectorIndexRetriever(
-#     index=index,
-#     similarity_top_k=4,
-# )
+            # Show raw data and chunks for debugging
+            dframe = pd.read_excel(excel_path)
+            with st.expander("Show Raw Data"):
+                st.write(dframe)
+            with st.expander("Show Document Chunks"):
+                st.write(chunks)
 
-# query_engine = RetrieverQueryEngine(
-#     retriever=retriever,
-#     response_synthesizer=response_synthesizer,
-# )
+            # Search history
+            if 'history' not in st.session_state:
+                st.session_state.history = []
 
-query_engine = index.as_query_engine(response_synthesizer=response_synthesizer, llm=llm)
+            # User input for question
+            question = st.text_input("Ask a question about the products:")
+            if question:
+                docs = vectorstore.similarity_search(question)
+                retriever = vectorstore.as_retriever()
 
-response = query_engine.query(qa_prompt_str)
+                # Define the prompt
+                template = """You are an intelligent assistant helping users with their questions as a shopping assistant. 
+                Use ONLY the following pieces of context to answer the question. Think step-by-step following the given points below and then answer.
+                Do not try to make up an answer:
+                - If the context is empty, response with “I do not know the answer to the question.”
+                - If the answer to the question cannot be determined from the context alone, response with “I cannot determine the answer to the question.”
+                - If the answer to the question can be determined from the context, response with the names of all the different products matching the criteria(the names MUST be different), separated by commas.
+                - You have to also write the category(Only one) and sub-category it belongs to as the heading of the answer. Categories are [Makeup, Skin Care, Hair Care, Fragrance, Tools & Accessories, Shave & Hair Removal, Personal Care, Salon & Spa Equipment]  
+                - You must thoroughly check the query for number of answer required and provide the specific number of answer. If none is provided, provide 3 most relevant answers.
+                - After picking the category, you MUST choose a sub-category from the following for each specific category that you found from the query
+                    Makeup: [Body, Eyes, Face, Lips, Makeup Palettes, Makeup Remover, Makeup Sets]
+                    Skin Care: [Body, Eyes, Face, Lip Care, Maternity, Sets & Kits, Sunscreens & Tanning Products]
+                    Hair Care: [Detanglers, Hair Accessories, Hair Coloring Products, Hair Cutting Tools, (Hair Extensions, Wigs & Accessories), Hair Fragrances, Hair Loss Products, Hair Masks, (Hair Perms, Relaxers & Texturizers), Hair Treatment Oils, Scalp Treatments, Shampoo & Conditioner, Styling Products]
+                    Fragrance: [Children's, Dusting Powders, Men's, Sets, Women's]
+                    Foot, Hand & Nail Care: []
+                    Tools & Accessories: [Bags & Cases, Bathing Accessories, Cotton Balls & Swabs, Makeup Brushes & Tools, Mirrors, Refillable Containers, Shave & Hair Removal, Skin Care Tools]
+                    Shave & Hair Removal: [Men's, Women's]
+                    Personal Care: [Bath & Bathing Accessories, Deodorants & Antiperspirants, Lip Care, Oral Care, Piercing & Tattoo Supplies, Scrubs & Body Treatments, Shave & Hair Removal]
+                    Salon & Spa Equipment: [Hair Drying Hoods, Galvanic Facial Machines, Handheld Mirrors, High-Frequency Facial Machines, Manicure Tables, Professional Massage Equipment, Salon & Spa Stools, Spa Beds & Tables, Salon & Spa Chairs, Spa Storage Systems, Spa Hot Towel Warmers]
 
-print(response)
+                Question: {question}  
+                =====================================================================
+                Context: {context}   
+                =====================================================================
+                """
+
+                prompt = ChatPromptTemplate.from_template(template)
+
+                # Local LLM
+                ollama_llm = "gemma"
+                model_local = ChatOllama(model=ollama_llm, temperature=0)
+
+                # Chain
+                chain = (
+                    {"context": retriever, "question": RunnablePassthrough()}
+                    | prompt
+                    | model_local
+                    | StrOutputParser()
+                )
+
+                # Get the answer
+                answer = chain.invoke(question)
+                st.write("Answer:", answer)
+
+                # Store search history
+                st.session_state.history.append((question, answer))
+
+            # Display search history
+            with st.expander("Search History"):
+                for q, a in st.session_state.history:
+                    st.write(f"**Question:** {q}")
+                    st.write(f"**Answer:** {a}")
+                    st.write("---")
+
+            # User feedback
+            feedback = st.text_input("Provide feedback on the answer:")
+            if feedback:
+                st.write("Thank you for your feedback!")
+
+            # Save and export options
+            if st.button("Save Search History"):
+                with open("search_history.txt", "w") as file:
+                    for q, a in st.session_state.history:
+                        file.write(f"Question: {q}\nAnswer: {a}\n\n")
+                st.write("Search history saved successfully.")
+        
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+        finally:
+            os.remove(excel_path)
+
+if __name__ == "__main__":
+    main()
